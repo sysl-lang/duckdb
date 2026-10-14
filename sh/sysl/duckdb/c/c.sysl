@@ -1,0 +1,303 @@
+// DuckDB's C API as `duckdb.h` declares it, and nothing else.
+//
+// **There is no C in this repository.** Every handle DuckDB hands out is a pointer to an opaque
+// struct, every aggregate it passes by value (`duckdb_result`, `duckdb_hugeint`, `duckdb_decimal`,
+// the date and time structs) is a struct sysl can lay out, and every callback this binding registers
+// takes only handles — so `extern` reaches all of it. The structs whose layout matters are pinned
+// against the header's own `sizeof` and `offsetof` by `tests.sysl`.
+//
+// Nothing here is meant to be called by a program. Every function takes or answers a raw handle
+// whose destruction is the caller's to arrange; the module above wraps each in a `&T` whose
+// destructor does it, exactly once.
+
+module sh.sysl.duckdb.c
+
+@link("duckdb")
+
+@include("stddef.h")
+@include("duckdb.h")
+
+// ## Handles
+//
+// `duckdb_database` and the rest are `struct _duckdb_database { void *internal_ptr; } *` — a pointer
+// to a one-word struct nobody reads. Declared opaque, a `*Database` is that pointer and a
+// `**Database` is the out-parameter `duckdb_open_ext` writes it through.
+opaque struct Database
+opaque struct Connection
+opaque struct Config
+opaque struct Prepared
+opaque struct Appender
+opaque struct LogicalType
+opaque struct DataChunk
+opaque struct Vector
+opaque struct ErrorData
+opaque struct ScalarFunction
+opaque struct FunctionInfo
+
+// ## The materialized result
+//
+// **The caller allocates it**: `duckdb_query` fills a `duckdb_result` the caller supplies, and
+// `duckdb_destroy_result` frees what it points to. Every field but the last is deprecated; the
+// binding reads none of them, and lays them out only so the struct is the size C says it is.
+struct Result
+    deprecated_column_count: u64
+    deprecated_row_count: u64
+    deprecated_rows_changed: u64
+    deprecated_columns: *u8
+    deprecated_error_message: *u8
+    internal_data: *u8
+
+// ## Values passed by value
+//
+// `duckdb_hugeint` is `upper * 2^64 + lower`, little half first — the same bits an `i128` has on a
+// little-endian machine, which is what lets a HUGEINT column be read as a `[]const i128` with no copy.
+struct Hugeint
+    lower: u64
+    upper: i64
+
+struct Uhugeint
+    lower: u64
+    upper: u64
+
+struct Decimal
+    width: u8
+    scale: u8
+    value: Hugeint
+
+struct Interval
+    months: i32
+    days: i32
+    micros: i64
+
+struct Date
+    days: i32
+
+struct Time
+    micros: i64
+
+struct Timestamp
+    micros: i64
+
+struct DateParts
+    year: i32
+    month: i8
+    day: i8
+
+struct TimeParts
+    hour: i8
+    min: i8
+    sec: i8
+    micros: i32
+
+struct TimestampParts
+    date: DateParts
+    time: TimeParts
+
+// One element of a VARCHAR or BLOB vector, as the pointer half of `duckdb_string_t`'s union. The
+// other half overlays the last twelve bytes with the characters themselves, which sysl cannot spell
+// (an untagged union); `string_t_data` is DuckDB's own answer to "where are the bytes", and the
+// module above calls it only for the inlined case.
+struct StringT
+    length: u32
+    prefix: [4]u8
+    ptr: *u8
+
+// A LIST vector's element: where the list's children start in the child vector, and how many.
+struct ListEntry
+    offset: u64
+    length: u64
+
+c const
+    RESULT_SIZE:      usize = "sizeof(duckdb_result)"
+    HUGEINT_SIZE:     usize = "sizeof(duckdb_hugeint)"
+    DECIMAL_SIZE:     usize = "sizeof(duckdb_decimal)"
+    DECIMAL_VALUE:    usize = "offsetof(duckdb_decimal, value)"
+    INTERVAL_SIZE:    usize = "sizeof(duckdb_interval)"
+    STRING_T_SIZE:    usize = "sizeof(duckdb_string_t)"
+    STRING_T_ALIGN:   usize = "_Alignof(duckdb_string_t)"
+    STRING_T_PTR:     usize = "offsetof(duckdb_string_t, value.pointer.ptr)"
+    STRING_T_INLINED: usize = "offsetof(duckdb_string_t, value.inlined.inlined)"
+    LIST_ENTRY_SIZE:  usize = "sizeof(duckdb_list_entry)"
+    TS_PARTS_SIZE:    usize = "sizeof(duckdb_timestamp_struct)"
+    TS_PARTS_TIME:    usize = "offsetof(duckdb_timestamp_struct, time)"
+    STRING_INLINE_MAX: u32 = "12"
+
+// `duckdb_state`.
+c const
+    SUCCESS: i32 = "DuckDBSuccess"
+    ERROR:   i32 = "DuckDBError"
+
+// `duckdb_type` — the ids a logical type answers.
+c const
+    TYPE_INVALID:      i32 = "DUCKDB_TYPE_INVALID"
+    TYPE_BOOLEAN:      i32 = "DUCKDB_TYPE_BOOLEAN"
+    TYPE_TINYINT:      i32 = "DUCKDB_TYPE_TINYINT"
+    TYPE_SMALLINT:     i32 = "DUCKDB_TYPE_SMALLINT"
+    TYPE_INTEGER:      i32 = "DUCKDB_TYPE_INTEGER"
+    TYPE_BIGINT:       i32 = "DUCKDB_TYPE_BIGINT"
+    TYPE_UTINYINT:     i32 = "DUCKDB_TYPE_UTINYINT"
+    TYPE_USMALLINT:    i32 = "DUCKDB_TYPE_USMALLINT"
+    TYPE_UINTEGER:     i32 = "DUCKDB_TYPE_UINTEGER"
+    TYPE_UBIGINT:      i32 = "DUCKDB_TYPE_UBIGINT"
+    TYPE_FLOAT:        i32 = "DUCKDB_TYPE_FLOAT"
+    TYPE_DOUBLE:       i32 = "DUCKDB_TYPE_DOUBLE"
+    TYPE_TIMESTAMP:    i32 = "DUCKDB_TYPE_TIMESTAMP"
+    TYPE_DATE:         i32 = "DUCKDB_TYPE_DATE"
+    TYPE_TIME:         i32 = "DUCKDB_TYPE_TIME"
+    TYPE_INTERVAL:     i32 = "DUCKDB_TYPE_INTERVAL"
+    TYPE_HUGEINT:      i32 = "DUCKDB_TYPE_HUGEINT"
+    TYPE_UHUGEINT:     i32 = "DUCKDB_TYPE_UHUGEINT"
+    TYPE_VARCHAR:      i32 = "DUCKDB_TYPE_VARCHAR"
+    TYPE_BLOB:         i32 = "DUCKDB_TYPE_BLOB"
+    TYPE_DECIMAL:      i32 = "DUCKDB_TYPE_DECIMAL"
+    TYPE_TIMESTAMP_S:  i32 = "DUCKDB_TYPE_TIMESTAMP_S"
+    TYPE_TIMESTAMP_MS: i32 = "DUCKDB_TYPE_TIMESTAMP_MS"
+    TYPE_TIMESTAMP_NS: i32 = "DUCKDB_TYPE_TIMESTAMP_NS"
+    TYPE_ENUM:         i32 = "DUCKDB_TYPE_ENUM"
+    TYPE_LIST:         i32 = "DUCKDB_TYPE_LIST"
+    TYPE_STRUCT:       i32 = "DUCKDB_TYPE_STRUCT"
+    TYPE_MAP:          i32 = "DUCKDB_TYPE_MAP"
+    TYPE_UUID:         i32 = "DUCKDB_TYPE_UUID"
+    TYPE_UNION:        i32 = "DUCKDB_TYPE_UNION"
+    TYPE_BIT:          i32 = "DUCKDB_TYPE_BIT"
+    TYPE_TIME_TZ:      i32 = "DUCKDB_TYPE_TIME_TZ"
+    TYPE_TIMESTAMP_TZ: i32 = "DUCKDB_TYPE_TIMESTAMP_TZ"
+    TYPE_ARRAY:        i32 = "DUCKDB_TYPE_ARRAY"
+    TYPE_SQLNULL:      i32 = "DUCKDB_TYPE_SQLNULL"
+
+// ## Opening and connecting
+extern "duckdb_library_version" library_version() -> *u8
+extern "duckdb_free" free(p: *u8)
+
+extern "duckdb_create_config" create_config(out: **Config) -> i32
+extern "duckdb_set_config" set_config(config: *Config, name: *u8, option: *u8) -> i32
+extern "duckdb_destroy_config" destroy_config(config: **Config)
+
+extern "duckdb_open_ext" open_ext(path: *u8, out: **Database, config: *Config, error: **u8) -> i32
+extern "duckdb_close" close(db: **Database)
+extern "duckdb_connect" connect(db: *Database, out: **Connection) -> i32
+extern "duckdb_disconnect" disconnect(con: **Connection)
+extern "duckdb_interrupt" interrupt(con: *Connection)
+
+// ## Queries and the materialized result
+extern "duckdb_query" query(con: *Connection, sql: *u8, out: *Result) -> i32
+extern "duckdb_destroy_result" destroy_result(r: *Result)
+extern "duckdb_result_error" result_error(r: *Result) -> *u8
+extern "duckdb_result_error_type" result_error_type(r: *Result) -> i32
+extern "duckdb_column_count" column_count(r: *Result) -> u64
+extern "duckdb_column_name" column_name(r: *Result, col: u64) -> *u8
+extern "duckdb_column_logical_type" column_logical_type(r: *Result, col: u64) -> *LogicalType
+extern "duckdb_rows_changed" rows_changed(r: *Result) -> u64
+
+// **`duckdb_result` by value**, 48 bytes: on arm64 and x86-64 alike an aggregate that size goes
+// through a hidden pointer to a copy, which `cabi` arranges. Every other result call takes its address.
+extern "duckdb_fetch_chunk" fetch_chunk(r: Result) -> *DataChunk
+
+// ## Data chunks and vectors
+extern "duckdb_data_chunk_get_size" chunk_size(chunk: *DataChunk) -> u64
+extern "duckdb_data_chunk_get_column_count" chunk_column_count(chunk: *DataChunk) -> u64
+extern "duckdb_data_chunk_get_vector" chunk_vector(chunk: *DataChunk, col: u64) -> *Vector
+extern "duckdb_destroy_data_chunk" destroy_data_chunk(chunk: **DataChunk)
+
+extern "duckdb_vector_get_data" vector_data(v: *Vector) -> *u8
+extern "duckdb_vector_get_validity" vector_validity(v: *Vector) -> *u64
+extern "duckdb_vector_get_column_type" vector_column_type(v: *Vector) -> *LogicalType
+extern "duckdb_vector_ensure_validity_writable" vector_ensure_validity_writable(v: *Vector)
+extern "duckdb_vector_assign_string_element_len" vector_assign_string(v: *Vector, row: u64, s: *u8, n: u64)
+extern "duckdb_validity_row_is_valid" validity_row_is_valid(mask: *u64, row: u64) -> bool
+extern "duckdb_validity_set_row_invalid" validity_set_row_invalid(mask: *u64, row: u64)
+extern "duckdb_string_t_data" string_t_data(s: *StringT) -> *u8
+extern "duckdb_string_is_inlined" string_is_inlined(s: StringT) -> bool
+extern "duckdb_list_vector_get_child" list_child(v: *Vector) -> *Vector
+extern "duckdb_list_vector_get_size" list_size(v: *Vector) -> u64
+extern "duckdb_struct_vector_get_child" struct_child(v: *Vector, i: u64) -> *Vector
+extern "duckdb_array_vector_get_child" array_child(v: *Vector) -> *Vector
+
+// ## Logical types
+extern "duckdb_create_logical_type" create_logical_type(id: i32) -> *LogicalType
+extern "duckdb_get_type_id" type_id(t: *LogicalType) -> i32
+extern "duckdb_destroy_logical_type" destroy_logical_type(t: **LogicalType)
+extern "duckdb_decimal_width" decimal_width(t: *LogicalType) -> u8
+extern "duckdb_decimal_scale" decimal_scale(t: *LogicalType) -> u8
+extern "duckdb_decimal_internal_type" decimal_internal_type(t: *LogicalType) -> i32
+extern "duckdb_list_type_child_type" list_type_child(t: *LogicalType) -> *LogicalType
+extern "duckdb_array_type_child_type" array_type_child(t: *LogicalType) -> *LogicalType
+extern "duckdb_array_type_array_size" array_type_size(t: *LogicalType) -> u64
+extern "duckdb_map_type_key_type" map_type_key(t: *LogicalType) -> *LogicalType
+extern "duckdb_map_type_value_type" map_type_value(t: *LogicalType) -> *LogicalType
+extern "duckdb_struct_type_child_count" struct_type_count(t: *LogicalType) -> u64
+extern "duckdb_struct_type_child_name" struct_type_name(t: *LogicalType, i: u64) -> *u8
+extern "duckdb_struct_type_child_type" struct_type_child(t: *LogicalType, i: u64) -> *LogicalType
+extern "duckdb_union_type_member_count" union_type_count(t: *LogicalType) -> u64
+extern "duckdb_union_type_member_name" union_type_name(t: *LogicalType, i: u64) -> *u8
+extern "duckdb_union_type_member_type" union_type_member(t: *LogicalType, i: u64) -> *LogicalType
+
+// ## Prepared statements
+extern "duckdb_prepare" prepare(con: *Connection, sql: *u8, out: **Prepared) -> i32
+extern "duckdb_prepare_error" prepare_error(p: *Prepared) -> *u8
+extern "duckdb_destroy_prepare" destroy_prepare(p: **Prepared)
+extern "duckdb_nparams" nparams(p: *Prepared) -> u64
+extern "duckdb_param_type" param_type(p: *Prepared, i: u64) -> i32
+extern "duckdb_clear_bindings" clear_bindings(p: *Prepared) -> i32
+extern "duckdb_execute_prepared" execute_prepared(p: *Prepared, out: *Result) -> i32
+extern "duckdb_bind_null" bind_null(p: *Prepared, i: u64) -> i32
+extern "duckdb_bind_boolean" bind_boolean(p: *Prepared, i: u64, v: bool) -> i32
+extern "duckdb_bind_int32" bind_int32(p: *Prepared, i: u64, v: i32) -> i32
+extern "duckdb_bind_int64" bind_int64(p: *Prepared, i: u64, v: i64) -> i32
+extern "duckdb_bind_uint64" bind_uint64(p: *Prepared, i: u64, v: u64) -> i32
+extern "duckdb_bind_double" bind_double(p: *Prepared, i: u64, v: f64) -> i32
+extern "duckdb_bind_hugeint" bind_hugeint(p: *Prepared, i: u64, v: Hugeint) -> i32
+extern "duckdb_bind_decimal" bind_decimal(p: *Prepared, i: u64, v: Decimal) -> i32
+extern "duckdb_bind_date" bind_date(p: *Prepared, i: u64, v: Date) -> i32
+extern "duckdb_bind_timestamp" bind_timestamp(p: *Prepared, i: u64, v: Timestamp) -> i32
+extern "duckdb_bind_interval" bind_interval(p: *Prepared, i: u64, v: Interval) -> i32
+extern "duckdb_bind_varchar_length" bind_varchar(p: *Prepared, i: u64, s: *u8, n: u64) -> i32
+extern "duckdb_bind_blob" bind_blob(p: *Prepared, i: u64, data: *u8, n: u64) -> i32
+
+// ## The appender
+extern "duckdb_appender_create" appender_create(con: *Connection, schema: *u8, table: *u8, out: **Appender) -> i32
+extern "duckdb_appender_destroy" appender_destroy(a: **Appender) -> i32
+extern "duckdb_appender_error_data" appender_error_data(a: *Appender) -> *ErrorData
+extern "duckdb_appender_end_row" appender_end_row(a: *Appender) -> i32
+extern "duckdb_appender_flush" appender_flush(a: *Appender) -> i32
+extern "duckdb_append_null" append_null(a: *Appender) -> i32
+extern "duckdb_append_bool" append_bool(a: *Appender, v: bool) -> i32
+extern "duckdb_append_int32" append_int32(a: *Appender, v: i32) -> i32
+extern "duckdb_append_int64" append_int64(a: *Appender, v: i64) -> i32
+extern "duckdb_append_double" append_double(a: *Appender, v: f64) -> i32
+extern "duckdb_append_hugeint" append_hugeint(a: *Appender, v: Hugeint) -> i32
+extern "duckdb_append_date" append_date(a: *Appender, v: Date) -> i32
+extern "duckdb_append_timestamp" append_timestamp(a: *Appender, v: Timestamp) -> i32
+extern "duckdb_append_varchar_length" append_varchar(a: *Appender, s: *u8, n: u64) -> i32
+extern "duckdb_append_blob" append_blob(a: *Appender, data: *u8, n: u64) -> i32
+
+extern "duckdb_error_data_message" error_data_message(e: *ErrorData) -> *u8
+extern "duckdb_destroy_error_data" destroy_error_data(e: **ErrorData)
+
+// ## Scalar functions
+//
+// The function DuckDB calls takes three handles, so its address is an ordinary `&f`. The extra-info
+// slot is a `void *` with a destructor DuckDB runs when the function is dropped from the catalog.
+extern "duckdb_create_scalar_function" create_scalar_function() -> *ScalarFunction
+extern "duckdb_destroy_scalar_function" destroy_scalar_function(f: **ScalarFunction)
+extern "duckdb_scalar_function_set_name" scalar_function_set_name(f: *ScalarFunction, name: *u8)
+extern "duckdb_scalar_function_add_parameter" scalar_function_add_parameter(f: *ScalarFunction, t: *LogicalType)
+extern "duckdb_scalar_function_set_return_type" scalar_function_set_return_type(f: *ScalarFunction, t: *LogicalType)
+extern "duckdb_scalar_function_set_function" scalar_function_set_function(f: *ScalarFunction, body: *extern(*FunctionInfo, *DataChunk, *Vector) -> unit)
+extern "duckdb_scalar_function_set_extra_info" scalar_function_set_extra_info(f: *ScalarFunction, info: *u8, destroy: *extern(*u8) -> unit)
+extern "duckdb_scalar_function_get_extra_info" scalar_function_get_extra_info(info: *FunctionInfo) -> *u8
+extern "duckdb_scalar_function_set_error" scalar_function_set_error(info: *FunctionInfo, message: *u8)
+extern "duckdb_register_scalar_function" register_scalar_function(con: *Connection, f: *ScalarFunction) -> i32
+
+// The C heap, for the one block DuckDB keeps on the binding's behalf: the slot a scalar function's
+// closure lives in, which DuckDB frees through the destructor it was handed.
+extern "calloc" calloc(n: usize, size: usize) -> *u8
+extern "free" libc_free(p: *u8)
+
+// ## Date and time
+extern "duckdb_from_date" from_date(d: Date) -> DateParts
+extern "duckdb_to_date" to_date(d: DateParts) -> Date
+extern "duckdb_from_timestamp" from_timestamp(t: Timestamp) -> TimestampParts
+extern "duckdb_to_timestamp" to_timestamp(t: TimestampParts) -> Timestamp
+extern "duckdb_hugeint_to_double" hugeint_to_double(v: Hugeint) -> f64
+extern "duckdb_decimal_to_double" decimal_to_double(v: Decimal) -> f64

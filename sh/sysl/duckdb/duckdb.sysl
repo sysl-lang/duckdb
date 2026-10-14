@@ -1,0 +1,915 @@
+// DuckDB for sysl: an in-process analytical database, through its C API.
+//
+//     val db = open()?                         // ":memory:", or a path
+//     val con = db.connect()?
+//     val r = con.query("SELECT i, i * 2.5::DOUBLE FROM range(10) t(i)")?
+//
+//     loop
+//         val chunk = r.next() match
+//             Some(ch) -> ch
+//             None     -> break
+//         val ids = chunk.column(0).i64s()?      // a view of DuckDB's own storage: no copy
+//         val xs  = chunk.column(1).f64s()?
+//         for i in 0..<chunk.size() do print(ids[i], xs[i])
+//
+// ==What a column is==
+//
+// DuckDB hands a result back as **data chunks** of up to 2048 rows, and each column of a chunk is a
+// **vector**: a flat C array of the column's physical type plus a validity bitmask. `Column` is one
+// of those, and its typed readers — `i64s`, `f64s`, `i32s`, `i128s` and the rest — answer a slice
+// pointing straight at the vector's array. A BIGINT column is a `[]const i64`, a DOUBLE a
+// `[]const f64`, a HUGEINT a `[]const i128`. Each reader checks the column's type first and answers
+// `Err` naming both types where they differ, rather than reinterpreting the bytes.
+//
+// A NULL is a bit in the mask, not a value in the array: the array holds whatever was there, and
+// `valid(row)` / `is_null(row)` is what says whether to believe it.
+//
+// **A view is valid while its chunk is, and nothing in sysl enforces that.** The slice is made from
+// the `*T` DuckDB answered, and a slice of a `*T` region has no owner to keep alive — so a view kept
+// past the chunk that made it reads freed memory. `Column` holds its chunk, so a *column* never
+// outlives it; the slices a column answers can. Anything wanted past the chunk is copied out inside
+// it (`text` copies; `bytes` does not).
+//
+// ==Ownership==
+//
+// Every handle is a `&T` whose destructor calls DuckDB's: a `Database` closes, a `Connection`
+// disconnects, a `QueryResult`, `Chunk`, `Prepared`, `Appender` and `LogicalType` each destroy
+// themselves, exactly once, when the last reference goes. Each holds what it was made from — a
+// connection holds its database, a result its connection — so the order they go in is always one
+// DuckDB accepts.
+
+module sh.sysl.duckdb
+
+import sh.sysl.duckdb.c
+import sysl.slices.as_ptr
+import sysl.text.{cstring, from_cstring, from_utf8}
+
+// ## Errors
+
+// What DuckDB said, as it said it. `kind` is DuckDB's own error class (`duckdb_error_type`) where
+// the call that failed reports one, and `Other` where it does not — the appender, `open`, and the
+// binding's own refusals.
+struct Error
+    kind: ErrorKind
+    message: string
+
+impl Display for Error
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(self.message, out, fmt)
+
+// DuckDB's `duckdb_error_type`, for the classes a caller is likely to branch on; every other class is
+// `Other`.
+enum ErrorKind
+    Parser
+    Catalog
+    Binder
+    Conversion
+    Constraint
+    InvalidInput
+    Io
+    Interrupt
+    OutOfRange
+    Other
+
+    of(code: i32) -> ErrorKind = code match
+        14 -> Parser
+        13 -> Catalog
+        24 -> Binder
+        2  -> Conversion
+        18 -> Constraint
+        32 -> InvalidInput
+        28 -> Io
+        29 -> Interrupt
+        1  -> OutOfRange
+        _  -> Other
+end ErrorKind
+
+// A refusal of the binding's own, where DuckDB was never asked.
+private refused(message: string) -> Error = Error(Other, message)
+
+private text_of(p: *u8, otherwise: string) -> string =
+    if p == null then otherwise else from_cstring(p).unwrap_or(otherwise)
+
+// ## Opening a database
+
+// One `SET`-style option given at open time: `Setting("threads", "4")`, `Setting("access_mode",
+// "READ_ONLY")`.
+struct Setting
+    name: string
+    value: string
+
+// The version string of the DuckDB this program links, e.g. `v1.5.6`.
+version() -> string = text_of(c.library_version(), "")
+
+// Open a database. `":memory:"` (the default) is a private in-memory one; anything else is a file,
+// created if it is not there.
+//
+// **A setting DuckDB does not know is refused here**, naming the setting: `duckdb_set_config` says
+// only that it failed, so the sentence is the binding's.
+open(path: string = ":memory:", settings: []const Setting = []) -> Result[&Database, Error]
+    var config: *c.Config
+
+    if c.create_config(&config) != c.SUCCESS then return Err(refused("DuckDB could not allocate a configuration"))
+
+    for s in settings
+        val name = cstring(s.name)
+        val value = cstring(s.value)
+
+        if c.set_config(config, name.ptr, value.ptr) != c.SUCCESS then
+            c.destroy_config(&config)
+            return Err(refused(s"DuckDB refused the setting '${s.name}' = '${s.value}'"))
+
+    val file = cstring(path)
+    var db: *c.Database
+    var why: *u8
+
+    val state = c.open_ext(file.ptr, &db, config, &why)
+
+    c.destroy_config(&config)
+
+    if state == c.SUCCESS then return Ok(Database(db))
+
+    val message = text_of(why, "DuckDB could not open the database")
+
+    if why != null then c.free(why)
+    Err(Error(Other, message))
+end open
+
+// A database instance: the catalog, the storage and the thread pool. Connections are made from it.
+struct Database
+    handle: *c.Database
+
+    connect(&self) -> Result[&Connection, Error]
+        var con: *c.Connection
+
+        if c.connect(self.handle, &con) != c.SUCCESS then return Err(refused("DuckDB could not connect"))
+        Ok(Connection(con, self))
+    end connect
+
+impl Drop for Database
+    drop(self)
+        var h = self.handle
+
+        c.close(&h)
+
+// ## Connections
+
+// One session against a database: its own transaction, its own settings. Every query goes through
+// one. A connection is not safe to use from two threads at once; DuckDB parallelises a query itself.
+struct Connection
+    handle: *c.Connection
+
+    // Held, so the database cannot be closed under a live connection.
+    db: &Database
+
+    // Run SQL and materialize its whole answer. Several statements separated by `;` run in turn and
+    // the answer is the last one's.
+    query(&self, sql: string) -> Result[&QueryResult, Error]
+        if self.handle == null then return Err(closed())
+
+        val text = cstring(sql)
+        val r: &QueryResult = QueryResult(c.Result(0, 0, 0, null, null, null), self)
+
+        if c.query(self.handle, text.ptr, &r.raw) == c.SUCCESS then return Ok(r)
+        Err(r.error())
+    end query
+
+    // Run SQL for its effect and answer how many rows it changed (0 for DDL).
+    exec(&self, sql: string) -> Result[u64, Error] = self.query(sql).map((r) -> r.rows_changed())
+
+    // Compile a statement with `?` or `$n` parameters, to be bound and run any number of times.
+    prepare(&self, sql: string) -> Result[&Prepared, Error]
+        if self.handle == null then return Err(closed())
+
+        val text = cstring(sql)
+        var p: *c.Prepared
+
+        val state = c.prepare(self.handle, text.ptr, &p)
+        val stmt = Prepared(p, self)
+
+        if state == c.SUCCESS then return Ok(stmt)
+        Err(Error(ErrorKind.of(0), text_of(c.prepare_error(p), "DuckDB could not prepare the statement")))
+    end prepare
+
+    // An appender for bulk insertion into `table` (in `schema`, by default the default one).
+    appender(&self, table: string, schema: string = "") -> Result[&Appender, Error]
+        if self.handle == null then return Err(closed())
+
+        val t = cstring(table)
+        val s = cstring(schema)
+        var a: *c.Appender
+
+        val state = c.appender_create(self.handle, if schema == "" then null else s.ptr, t.ptr, &a)
+        val app = Appender(a, self)
+
+        if state == c.SUCCESS then return Ok(app)
+        Err(app.failure("DuckDB could not create the appender"))
+    end appender
+
+    // Ask a query running on this connection, from another thread, to stop. It fails with an
+    // `Interrupt` error.
+    interrupt(&self)
+        if self.handle != null then c.interrupt(self.handle)
+
+    // Disconnect now rather than when the last reference goes. Every call after it answers the
+    // binding's "the connection is closed" — DuckDB itself would dereference the null handle.
+    close(&self)
+        if self.handle == null then return
+
+        var h = self.handle
+
+        c.disconnect(&h)
+        self.handle = null
+    end close
+
+    // Register a scalar function written in sysl. DuckDB calls `body` once per chunk of input, from
+    // whichever of its worker threads is executing the query, so it is a `&sync Fn`: what it may
+    // capture is checked by the compiler (scalars, `&sync T`, `*T`; no `string`, no slice, no plain
+    // `&T`). It reads its arguments from the input chunk's columns and writes one value per row into
+    // `out`; an `Err` fails the query with that message.
+    //
+    // The closure is kept alive by DuckDB's catalog, not by this connection: it lives in a C block
+    // DuckDB frees through the destructor it is given, which releases the closure.
+    @crossing(body)
+    register_scalar(&self, name: string, params: []const TypeId, returns: TypeId,
+                    body: &sync Fn(&Chunk, Column) -> Result[unit, string]) -> Result[unit, Error]
+        if self.handle == null then return Err(closed())
+
+        var f = c.create_scalar_function()
+        val n = cstring(name)
+
+        c.scalar_function_set_name(f, n.ptr)
+
+        for p in params
+            var t = c.create_logical_type(p.code())
+
+            c.scalar_function_add_parameter(f, t)
+            c.destroy_logical_type(&t)
+
+        var r = c.create_logical_type(returns.code())
+
+        c.scalar_function_set_return_type(f, r)
+        c.destroy_logical_type(&r)
+
+        val slot: *Slot = ptr_cast(c.calloc(1, sizeof(Slot)))
+
+        slot.body = body
+        c.scalar_function_set_extra_info(f, ptr_cast(slot), &forget_slot)
+        c.scalar_function_set_function(f, &call_slot)
+
+        val state = c.register_scalar_function(self.handle, f)
+
+        c.destroy_scalar_function(&f)
+
+        if state == c.SUCCESS then return Ok(())
+        Err(refused(s"DuckDB refused the scalar function '$name'"))
+    end register_scalar
+end Connection
+
+impl Drop for Connection
+    drop(self)
+        var h = self.handle
+
+        if h != null then c.disconnect(&h)
+
+private closed() -> Error = refused("the connection is closed")
+
+// ## Scalar functions
+
+// The C block a registered closure lives in. Zeroed by `calloc`, so its `&sync Fn` field takes its
+// first assignment safely, and given back with `release` when DuckDB drops the function.
+struct Slot
+    body: &sync Fn(&Chunk, Column) -> Result[unit, string]
+
+// The one function DuckDB calls for every sysl scalar function: it finds the closure through the
+// extra-info slot and hands it the input chunk (DuckDB's, so not destroyed here) and the output.
+private call_slot(info: *c.FunctionInfo, input: *c.DataChunk, output: *c.Vector)
+    val slot: *Slot = ptr_cast(c.scalar_function_get_extra_info(info))
+    val chunk = Chunk(input, false, None)
+    val out = Column(output, chunk.size(), Some(chunk))
+
+    slot.body(chunk, out) match
+        Ok(_) -> ()
+        Err(why) ->
+            val m = cstring(why)
+
+            c.scalar_function_set_error(info, m.ptr)
+end call_slot
+
+private forget_slot(p: *u8)
+    val slot: *Slot = ptr_cast(p)
+
+    release(slot.body)
+    c.libc_free(p)
+
+// ## Results
+
+// A materialized result. Its rows are read a chunk at a time with `next`.
+struct QueryResult
+    raw: c.Result
+
+    // Held, so the connection outlives what it produced.
+    con: &Connection
+
+    columns(&self) -> usize = usize(c.column_count(&self.raw))
+
+    name(&self, col: usize) -> string = text_of(c.column_name(&self.raw, u64(col)), "")
+
+    // The column's full logical type — width and scale of a DECIMAL, the child of a LIST, the fields
+    // of a STRUCT.
+    type_of(&self, col: usize) -> &LogicalType = LogicalType(c.column_logical_type(&self.raw, u64(col)))
+
+    // How many rows an INSERT, UPDATE or DELETE changed.
+    rows_changed(&self) -> u64 = c.rows_changed(&self.raw)
+
+    // The next chunk of rows, or `None` once every row has been handed out.
+    next(&self) -> Option[&Chunk]
+        val ch = c.fetch_chunk(self.raw)
+
+        if ch == null then None else Some(Chunk(ch, true, Some(self)))
+    end next
+
+    private error(&self) -> Error =
+        Error(ErrorKind.of(c.result_error_type(&self.raw)),
+              text_of(c.result_error(&self.raw), "DuckDB reported an error it did not describe"))
+end QueryResult
+
+impl Drop for QueryResult
+    drop(self)
+        var raw = self.raw
+
+        c.destroy_result(&raw)
+
+// ## Chunks
+
+// A run of up to 2048 rows, column by column. A chunk fetched from a result is the binding's and is
+// destroyed when the last reference goes; the input chunk a scalar function is handed is DuckDB's.
+struct Chunk
+    handle: *c.DataChunk
+    owned: bool
+
+    // The result this came from, held so it is not destroyed first.
+    result: Option[&QueryResult]
+
+    size(self) -> usize = usize(c.chunk_size(self.handle))
+
+    columns(self) -> usize = usize(c.chunk_column_count(self.handle))
+
+    // One column, holding this chunk so the vector it reads stays alive.
+    column(&self, col: usize) -> Column = Column(c.chunk_vector(self.handle, u64(col)), self.size(), Some(self))
+end Chunk
+
+impl Drop for Chunk
+    drop(self)
+        var h = self.handle
+
+        if self.owned then c.destroy_data_chunk(&h)
+
+// ## Columns
+
+// One vector of a chunk: a flat array of the column's physical type, a validity mask, and for the
+// nested types a child vector. `rows` is how many entries it has.
+struct Column
+    vec: *c.Vector
+    rows: usize
+
+    // The chunk this vector belongs to. `None` only for the output vector of a scalar function.
+    chunk: Option[&Chunk]
+
+    // The column's logical type.
+    type_of(self) -> &LogicalType = LogicalType(c.vector_column_type(self.vec))
+
+    // The column's type id, without keeping the logical type.
+    id(self) -> TypeId = self.type_of().id()
+
+    // Whether row `row` holds a value. A vector with no mask at all is all valid.
+    valid(self, row: usize) -> bool
+        val mask = c.vector_validity(self.vec)
+
+        mask == null || (mask[row / 64] >> u64(row % 64)) & 1 == 1
+    end valid
+
+    is_null(self, row: usize) -> bool = !self.valid(row)
+
+    // The validity mask itself, one bit per row, least significant first; `None` where every row is
+    // valid and DuckDB allocated no mask.
+    validity(self) -> Option[[]const u64]
+        val mask = c.vector_validity(self.vec)
+
+        if mask == null then None else Some(mask[0..<(self.rows + 63) / 64])
+    end validity
+
+    bools(self) -> Result[[]const bool, Error] = self.typed(Boolean)
+    i8s(self) -> Result[[]const i8, Error] = self.typed(Tinyint)
+    i16s(self) -> Result[[]const i16, Error] = self.typed(Smallint)
+    i32s(self) -> Result[[]const i32, Error] = self.typed(Integer)
+    i64s(self) -> Result[[]const i64, Error] = self.typed(Bigint)
+    u8s(self) -> Result[[]const u8, Error] = self.typed(Utinyint)
+    u16s(self) -> Result[[]const u16, Error] = self.typed(Usmallint)
+    u32s(self) -> Result[[]const u32, Error] = self.typed(Uinteger)
+    u64s(self) -> Result[[]const u64, Error] = self.typed(Ubigint)
+    f32s(self) -> Result[[]const f32, Error] = self.typed(Float)
+    f64s(self) -> Result[[]const f64, Error] = self.typed(Double)
+
+    // A HUGEINT column, whose `{lower, upper}` halves are an `i128`'s bits.
+    i128s(self) -> Result[[]const i128, Error] = self.typed(Hugeint)
+    u128s(self) -> Result[[]const u128, Error] = self.typed(Uhugeint)
+
+    // A DATE column: days since 1970-01-01.
+    dates(self) -> Result[[]const i32, Error] = self.typed(Date)
+
+    // A TIMESTAMP or TIMESTAMPTZ column: microseconds since 1970-01-01 00:00:00 UTC.
+    timestamps(self) -> Result[[]const i64, Error]
+        val id = self.id()
+
+        if id != Timestamp && id != TimestampTz then return Err(mismatch(Timestamp, id))
+
+        val p: *i64 = ptr_cast(c.vector_data(self.vec))
+
+        Ok(p[0..<self.rows])
+    end timestamps
+
+    // A TIME column: microseconds since midnight.
+    times(self) -> Result[[]const i64, Error] = self.typed(Time)
+
+    intervals(self) -> Result[[]const Interval, Error] = self.typed(IntervalType)
+
+    // The bytes of a VARCHAR or BLOB at `row`, as a view of DuckDB's storage — `None` for NULL.
+    //
+    // A `duckdb_string_t` of at most twelve bytes holds them inline after its length; a longer one
+    // holds a pointer. The binding reads the length and the pointer itself, and asks DuckDB where the
+    // inline bytes start, since that half of the union has no sysl spelling.
+    bytes(self, row: usize) -> Option[[]const u8]
+        if self.is_null(row) then return None
+
+        val elems: *c.StringT = ptr_cast(c.vector_data(self.vec))
+        val e = &elems[row]
+        val n = usize(e.length)
+        val p = if e.length <= c.STRING_INLINE_MAX then c.string_t_data(e) else e.ptr
+
+        Some(if n == 0 then [] else p[0..<n])
+    end bytes
+
+    // A VARCHAR at `row`, copied into a `string` of its own, so it may outlive the chunk.
+    text(self, row: usize) -> Result[Option[string], Error]
+        val id = self.id()
+
+        if id != Varchar then return Err(mismatch(Varchar, id))
+
+        self.bytes(row) match
+            None -> Ok(None)
+            Some(b) -> from_utf8(b) match
+                Ok(s) -> Ok(Some(s))
+                Err(_) -> Err(refused("a VARCHAR held bytes that are not UTF-8"))
+    end text
+
+    // A DECIMAL at `row`, as its unscaled value and the column's width and scale. DuckDB stores it in
+    // the narrowest of i16, i32, i64 and HUGEINT the width fits.
+    decimal(self, row: usize) -> Result[Option[Decimal], Error]
+        val t = self.type_of()
+
+        if t.id() != DecimalType then return Err(mismatch(DecimalType, t.id()))
+        if self.is_null(row) then return Ok(None)
+
+        val data = c.vector_data(self.vec)
+        val v: i128 = TypeId.of(c.decimal_internal_type(t.handle)) match
+            Smallint ->
+                val p: *i16 = ptr_cast(data)
+
+                i128(p[row])
+            Integer ->
+                val p: *i32 = ptr_cast(data)
+
+                i128(p[row])
+            Bigint ->
+                val p: *i64 = ptr_cast(data)
+
+                i128(p[row])
+            _ ->
+                val p: *i128 = ptr_cast(data)
+
+                p[row]
+
+        Ok(Some(Decimal(v, t.decimal_width(), t.decimal_scale())))
+    end decimal
+
+    // A LIST column's entries: where each row's elements start in `elements()`, and how many.
+    lists(self) -> Result[[]const ListEntry, Error] = self.typed(List)
+
+    // The child vector holding every element of every list (a LIST or MAP), or of every fixed-size
+    // array (an ARRAY).
+    elements(self) -> Column
+        val id = self.id()
+
+        if id == ArrayType then
+            val child = c.array_child(self.vec)
+
+            return Column(child, self.rows * usize(self.type_of().array_size()), self.chunk)
+
+        Column(c.list_child(self.vec), usize(c.list_size(self.vec)), self.chunk)
+    end elements
+
+    // Field `i` of a STRUCT column (a UNION's member `i` is field `i + 1`; field 0 is its tag).
+    field(self, i: usize) -> Column = Column(c.struct_child(self.vec, u64(i)), self.rows, self.chunk)
+
+    // ## Writing, for a scalar function's output
+
+    // The output vector as a writable `[]i64`.
+    out_i64s(self) -> Result[[]i64, Error] = self.writable(Bigint)
+    out_f64s(self) -> Result[[]f64, Error] = self.writable(Double)
+    out_i32s(self) -> Result[[]i32, Error] = self.writable(Integer)
+    out_bools(self) -> Result[[]bool, Error] = self.writable(Boolean)
+
+    // Mark `row` NULL.
+    set_null(self, row: usize)
+        c.vector_ensure_validity_writable(self.vec)
+        c.validity_set_row_invalid(c.vector_validity(self.vec), u64(row))
+
+    // Store a VARCHAR at `row`; DuckDB copies the bytes.
+    set_text(self, row: usize, s: string) = c.vector_assign_string(self.vec, u64(row), as_ptr(s.bytes), u64(s.len))
+
+    private typed[T](self, want: TypeId) -> Result[[]const T, Error]
+        val id = self.id()
+
+        if id != want then return Err(mismatch(want, id))
+
+        val p: *T = ptr_cast(c.vector_data(self.vec))
+
+        Ok(p[0..<self.rows])
+    end typed
+
+    private writable[T](self, want: TypeId) -> Result[[]T, Error]
+        val id = self.id()
+
+        if id != want then return Err(mismatch(want, id))
+
+        val p: *T = ptr_cast(c.vector_data(self.vec))
+
+        Ok(p[0..<self.rows])
+    end writable
+end Column
+
+private mismatch(want: TypeId, have: TypeId) -> Error =
+    refused(s"the column is ${have.name()}, not ${want.name()}")
+
+// A LIST row: `length` elements starting at `offset` in the column's `elements()`.
+struct ListEntry
+    offset: u64
+    length: u64
+
+// An INTERVAL: months, days and microseconds, kept apart because none converts exactly to another.
+struct Interval
+    months: i32
+    days: i32
+    micros: i64
+
+// A DECIMAL: `value / 10^scale`, at most `width` digits.
+struct Decimal
+    value: i128
+    width: u8
+    scale: u8
+
+    // The value as DuckDB would print it: `-12.345`, `0.05`, `7`.
+    text(self) -> string
+        val neg = self.value < 0
+        val digits = s"${if neg then -self.value else self.value}"
+        val scale = usize(self.scale)
+
+        if scale == 0 then return if neg then s"-$digits" else digits
+
+        var padded = digits
+
+        while padded.len <= scale
+            padded = s"0$padded"
+
+        val cut = padded.len - scale
+        val body = s"${padded[0..<cut]}.${padded[cut..<padded.len]}"
+
+        if neg then s"-$body" else body
+    end text
+
+impl Display for Decimal
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(self.text(), out, fmt)
+
+// ## Logical types
+
+// A column's full type. Answered by `QueryResult.type_of` and `Column.type_of`, destroyed with the
+// last reference.
+struct LogicalType
+    handle: *c.LogicalType
+
+    id(self) -> TypeId = TypeId.of(c.type_id(self.handle))
+
+    // DECIMAL's width and scale.
+    decimal_width(self) -> u8 = c.decimal_width(self.handle)
+    decimal_scale(self) -> u8 = c.decimal_scale(self.handle)
+
+    // A LIST's element type.
+    child(self) -> &LogicalType = LogicalType(c.list_type_child(self.handle))
+
+    // An ARRAY's element type, and its fixed length.
+    array_child(self) -> &LogicalType = LogicalType(c.array_type_child(self.handle))
+    array_size(self) -> u64 = c.array_type_size(self.handle)
+
+    // A MAP's key and value types.
+    key(self) -> &LogicalType = LogicalType(c.map_type_key(self.handle))
+    value(self) -> &LogicalType = LogicalType(c.map_type_value(self.handle))
+
+    // A STRUCT's fields.
+    fields(self) -> usize = usize(c.struct_type_count(self.handle))
+    field_name(self, i: usize) -> string = owned_text(c.struct_type_name(self.handle, u64(i)))
+    field_type(self, i: usize) -> &LogicalType = LogicalType(c.struct_type_child(self.handle, u64(i)))
+
+    // A UNION's members.
+    members(self) -> usize = usize(c.union_type_count(self.handle))
+    member_name(self, i: usize) -> string = owned_text(c.union_type_name(self.handle, u64(i)))
+    member_type(self, i: usize) -> &LogicalType = LogicalType(c.union_type_member(self.handle, u64(i)))
+end LogicalType
+
+impl Drop for LogicalType
+    drop(self)
+        var h = self.handle
+
+        c.destroy_logical_type(&h)
+
+// A `char *` DuckDB allocated and the caller frees, copied out and freed.
+private owned_text(p: *u8) -> string
+    val s = text_of(p, "")
+
+    if p != null then c.free(p)
+    s
+end owned_text
+
+// `duckdb_type`: what a logical type is, without its parameters.
+enum TypeId
+    Invalid
+    Boolean
+    Tinyint
+    Smallint
+    Integer
+    Bigint
+    Utinyint
+    Usmallint
+    Uinteger
+    Ubigint
+    Float
+    Double
+    Timestamp
+    Date
+    Time
+    IntervalType
+    Hugeint
+    Uhugeint
+    Varchar
+    Blob
+    DecimalType
+    TimestampS
+    TimestampMs
+    TimestampNs
+    Enum
+    List
+    Struct
+    Map
+    ArrayType
+    Uuid
+    Union
+    Bit
+    TimeTz
+    TimestampTz
+    SqlNull
+
+    // A type this binding does not name: VARIANT, GEOMETRY, BIGNUM and whatever a later DuckDB adds.
+    Unknown
+
+    of(code: i32) -> TypeId = code match
+        c.TYPE_BOOLEAN      -> Boolean
+        c.TYPE_TINYINT      -> Tinyint
+        c.TYPE_SMALLINT     -> Smallint
+        c.TYPE_INTEGER      -> Integer
+        c.TYPE_BIGINT       -> Bigint
+        c.TYPE_UTINYINT     -> Utinyint
+        c.TYPE_USMALLINT    -> Usmallint
+        c.TYPE_UINTEGER     -> Uinteger
+        c.TYPE_UBIGINT      -> Ubigint
+        c.TYPE_FLOAT        -> Float
+        c.TYPE_DOUBLE       -> Double
+        c.TYPE_TIMESTAMP    -> Timestamp
+        c.TYPE_DATE         -> Date
+        c.TYPE_TIME         -> Time
+        c.TYPE_INTERVAL     -> IntervalType
+        c.TYPE_HUGEINT      -> Hugeint
+        c.TYPE_UHUGEINT     -> Uhugeint
+        c.TYPE_VARCHAR      -> Varchar
+        c.TYPE_BLOB         -> Blob
+        c.TYPE_DECIMAL      -> DecimalType
+        c.TYPE_TIMESTAMP_S  -> TimestampS
+        c.TYPE_TIMESTAMP_MS -> TimestampMs
+        c.TYPE_TIMESTAMP_NS -> TimestampNs
+        c.TYPE_ENUM         -> Enum
+        c.TYPE_LIST         -> List
+        c.TYPE_STRUCT       -> Struct
+        c.TYPE_MAP          -> Map
+        c.TYPE_ARRAY        -> ArrayType
+        c.TYPE_UUID         -> Uuid
+        c.TYPE_UNION        -> Union
+        c.TYPE_BIT          -> Bit
+        c.TYPE_TIME_TZ      -> TimeTz
+        c.TYPE_TIMESTAMP_TZ -> TimestampTz
+        c.TYPE_SQLNULL      -> SqlNull
+        c.TYPE_INVALID      -> Invalid
+        _                   -> Unknown
+
+    // The `duckdb_type` number.
+    code(self) -> i32 = self match
+        Boolean      -> c.TYPE_BOOLEAN
+        Tinyint      -> c.TYPE_TINYINT
+        Smallint     -> c.TYPE_SMALLINT
+        Integer      -> c.TYPE_INTEGER
+        Bigint       -> c.TYPE_BIGINT
+        Utinyint     -> c.TYPE_UTINYINT
+        Usmallint    -> c.TYPE_USMALLINT
+        Uinteger     -> c.TYPE_UINTEGER
+        Ubigint      -> c.TYPE_UBIGINT
+        Float        -> c.TYPE_FLOAT
+        Double       -> c.TYPE_DOUBLE
+        Timestamp    -> c.TYPE_TIMESTAMP
+        Date         -> c.TYPE_DATE
+        Time         -> c.TYPE_TIME
+        IntervalType -> c.TYPE_INTERVAL
+        Hugeint      -> c.TYPE_HUGEINT
+        Uhugeint     -> c.TYPE_UHUGEINT
+        Varchar      -> c.TYPE_VARCHAR
+        Blob         -> c.TYPE_BLOB
+        DecimalType  -> c.TYPE_DECIMAL
+        TimestampS   -> c.TYPE_TIMESTAMP_S
+        TimestampMs  -> c.TYPE_TIMESTAMP_MS
+        TimestampNs  -> c.TYPE_TIMESTAMP_NS
+        Enum         -> c.TYPE_ENUM
+        List         -> c.TYPE_LIST
+        Struct       -> c.TYPE_STRUCT
+        Map          -> c.TYPE_MAP
+        ArrayType    -> c.TYPE_ARRAY
+        Uuid         -> c.TYPE_UUID
+        Union        -> c.TYPE_UNION
+        Bit          -> c.TYPE_BIT
+        TimeTz       -> c.TYPE_TIME_TZ
+        TimestampTz  -> c.TYPE_TIMESTAMP_TZ
+        SqlNull      -> c.TYPE_SQLNULL
+        Invalid      -> c.TYPE_INVALID
+        Unknown      -> c.TYPE_INVALID
+
+    // The SQL name, as DuckDB spells it.
+    name(self) -> string = self match
+        Boolean      -> "BOOLEAN"
+        Tinyint      -> "TINYINT"
+        Smallint     -> "SMALLINT"
+        Integer      -> "INTEGER"
+        Bigint       -> "BIGINT"
+        Utinyint     -> "UTINYINT"
+        Usmallint    -> "USMALLINT"
+        Uinteger     -> "UINTEGER"
+        Ubigint      -> "UBIGINT"
+        Float        -> "FLOAT"
+        Double       -> "DOUBLE"
+        Timestamp    -> "TIMESTAMP"
+        Date         -> "DATE"
+        Time         -> "TIME"
+        IntervalType -> "INTERVAL"
+        Hugeint      -> "HUGEINT"
+        Uhugeint     -> "UHUGEINT"
+        Varchar      -> "VARCHAR"
+        Blob         -> "BLOB"
+        DecimalType  -> "DECIMAL"
+        TimestampS   -> "TIMESTAMP_S"
+        TimestampMs  -> "TIMESTAMP_MS"
+        TimestampNs  -> "TIMESTAMP_NS"
+        Enum         -> "ENUM"
+        List         -> "LIST"
+        Struct       -> "STRUCT"
+        Map          -> "MAP"
+        ArrayType    -> "ARRAY"
+        Uuid         -> "UUID"
+        Union        -> "UNION"
+        Bit          -> "BIT"
+        TimeTz       -> "TIME WITH TIME ZONE"
+        TimestampTz  -> "TIMESTAMP WITH TIME ZONE"
+        SqlNull      -> "NULL"
+        Invalid      -> "INVALID"
+        Unknown      -> "a type this binding does not name"
+end TypeId
+
+// ## Prepared statements
+
+// A compiled statement. Parameters are numbered from 1, as DuckDB numbers them; a bind DuckDB
+// refuses (an index past the last) answers its message, and a value of the wrong type is refused when
+// the statement runs.
+struct Prepared
+    handle: *c.Prepared
+    con: &Connection
+
+    params(self) -> usize = usize(c.nparams(self.handle))
+
+    // The type DuckDB inferred for parameter `i`.
+    param_type(self, i: usize) -> TypeId = TypeId.of(c.param_type(self.handle, u64(i)))
+
+    bind_null(self, i: usize) -> Result[unit, Error] = self.bound(c.bind_null(self.handle, u64(i)))
+    bind_bool(self, i: usize, v: bool) -> Result[unit, Error] = self.bound(c.bind_boolean(self.handle, u64(i), v))
+    bind_i32(self, i: usize, v: i32) -> Result[unit, Error] = self.bound(c.bind_int32(self.handle, u64(i), v))
+    bind_i64(self, i: usize, v: i64) -> Result[unit, Error] = self.bound(c.bind_int64(self.handle, u64(i), v))
+    bind_u64(self, i: usize, v: u64) -> Result[unit, Error] = self.bound(c.bind_uint64(self.handle, u64(i), v))
+    bind_f64(self, i: usize, v: f64) -> Result[unit, Error] = self.bound(c.bind_double(self.handle, u64(i), v))
+    bind_i128(self, i: usize, v: i128) -> Result[unit, Error] = self.bound(c.bind_hugeint(self.handle, u64(i), hugeint(v)))
+
+    bind_decimal(self, i: usize, v: Decimal) -> Result[unit, Error] =
+        self.bound(c.bind_decimal(self.handle, u64(i), c.Decimal(v.width, v.scale, hugeint(v.value))))
+
+    // A DATE, as days since 1970-01-01.
+    bind_date(self, i: usize, days: i32) -> Result[unit, Error] = self.bound(c.bind_date(self.handle, u64(i), c.Date(days)))
+
+    // A TIMESTAMP, as microseconds since the epoch.
+    bind_timestamp(self, i: usize, micros: i64) -> Result[unit, Error] =
+        self.bound(c.bind_timestamp(self.handle, u64(i), c.Timestamp(micros)))
+
+    bind_interval(self, i: usize, v: Interval) -> Result[unit, Error] =
+        self.bound(c.bind_interval(self.handle, u64(i), c.Interval(v.months, v.days, v.micros)))
+
+    bind_text(self, i: usize, s: string) -> Result[unit, Error] =
+        self.bound(c.bind_varchar(self.handle, u64(i), as_ptr(s.bytes), u64(s.len)))
+
+    bind_blob(self, i: usize, b: []const u8) -> Result[unit, Error] =
+        self.bound(c.bind_blob(self.handle, u64(i), as_ptr(b), u64(b.len)))
+
+    // Set every parameter back to unbound.
+    clear(self) -> Result[unit, Error] = self.bound(c.clear_bindings(self.handle))
+
+    // Run it with the current bindings.
+    execute(&self) -> Result[&QueryResult, Error]
+        if self.con.handle == null then return Err(closed())
+
+        val r: &QueryResult = QueryResult(c.Result(0, 0, 0, null, null, null), self.con)
+
+        if c.execute_prepared(self.handle, &r.raw) == c.SUCCESS then return Ok(r)
+        Err(r.error())
+    end execute
+
+    private bound(self, state: i32) -> Result[unit, Error] =
+        if state == c.SUCCESS then Ok(())
+        else Err(Error(InvalidInput, text_of(c.prepare_error(self.handle), "DuckDB refused the binding")))
+end Prepared
+
+impl Drop for Prepared
+    drop(self)
+        var h = self.handle
+
+        c.destroy_prepare(&h)
+
+private hugeint(v: i128) -> c.Hugeint = c.Hugeint(u64(v & 0xFFFF_FFFF_FFFF_FFFF), i64(v >> 64))
+
+// ## The appender
+
+// Bulk insertion, row by row, much faster than INSERT: each value is appended in column order and
+// `end_row` closes the row. Rows are flushed to the table every so often, on `flush`, and when the
+// last reference goes — a failure there has nowhere to be reported, so a caller that cares calls
+// `flush` itself.
+struct Appender
+    handle: *c.Appender
+    con: &Connection
+
+    add_null(self) -> Result[unit, Error] = self.done(c.append_null(self.handle))
+    add_bool(self, v: bool) -> Result[unit, Error] = self.done(c.append_bool(self.handle, v))
+    add_i32(self, v: i32) -> Result[unit, Error] = self.done(c.append_int32(self.handle, v))
+    add_i64(self, v: i64) -> Result[unit, Error] = self.done(c.append_int64(self.handle, v))
+    add_f64(self, v: f64) -> Result[unit, Error] = self.done(c.append_double(self.handle, v))
+    add_i128(self, v: i128) -> Result[unit, Error] = self.done(c.append_hugeint(self.handle, hugeint(v)))
+
+    // A DATE as days since 1970-01-01; a TIMESTAMP as microseconds since the epoch.
+    add_date(self, days: i32) -> Result[unit, Error] = self.done(c.append_date(self.handle, c.Date(days)))
+    add_timestamp(self, micros: i64) -> Result[unit, Error] =
+        self.done(c.append_timestamp(self.handle, c.Timestamp(micros)))
+
+    add_text(self, s: string) -> Result[unit, Error] =
+        self.done(c.append_varchar(self.handle, as_ptr(s.bytes), u64(s.len)))
+    add_blob(self, b: []const u8) -> Result[unit, Error] = self.done(c.append_blob(self.handle, as_ptr(b), u64(b.len)))
+
+    end_row(self) -> Result[unit, Error] = self.done(c.appender_end_row(self.handle))
+    flush(self) -> Result[unit, Error] = self.done(c.appender_flush(self.handle))
+
+    private done(self, state: i32) -> Result[unit, Error] =
+        if state == c.SUCCESS then Ok(()) else Err(self.failure("DuckDB refused the value"))
+
+    private failure(self, otherwise: string) -> Error
+        var e = c.appender_error_data(self.handle)
+
+        if e == null then return refused(otherwise)
+
+        val message = text_of(c.error_data_message(e), otherwise)
+
+        c.destroy_error_data(&e)
+        Error(Other, message)
+    end failure
+end Appender
+
+impl Drop for Appender
+    drop(self)
+        var h = self.handle
+
+        c.appender_destroy(&h)

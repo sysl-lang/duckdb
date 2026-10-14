@@ -1,0 +1,30 @@
+// DuckDB for sysl — an in-process analytical database, through its C API.
+//
+//     dependencies {
+//       duckdb { git = "github.com/sysl-lang/duckdb", version = "0.1.0" }
+//     }
+//
+// **DuckDB has to be installed**: `brew install duckdb` on macOS; elsewhere, the `libduckdb` release
+// archive from duckdb.org unpacked somewhere with `duckdb.h` beside `libduckdb`.
+
+package {
+  name    = "duckdb"
+  version = "0.1.0"
+  sysl    = "0.1.0-alpha.11"
+}
+
+// **`headers` rather than `pkg_config`, and that is DuckDB's doing.** It installs a CMake package
+// configuration and no `.pc` file, so there is nothing for `pkg-config` to answer — the paths are
+// passed instead, as for quickjs-ng:
+//
+//     sysl test . --include-path duckdb=/opt/homebrew/include --link-path /opt/homebrew/lib
+//
+// **`os` and `heap`**: DuckDB is a database engine with a buffer manager, a thread pool and files.
+requires {
+  os   = true
+  heap = true
+
+  headers {
+    duckdb = "DuckDB's C header — `brew install duckdb`; there is no .pc file, so the include path is passed rather than probed"
+  }
+}

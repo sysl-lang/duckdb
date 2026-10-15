@@ -3,6 +3,8 @@
 [DuckDB](https://duckdb.org) for [sysl](https://github.com/sysl-lang/sysl): an in-process analytical
 database, bound through its C API. Module `sh.sysl.duckdb`.
 
+*An independent sysl package for DuckDB. It is not affiliated with or endorsed by DuckDB's authors or trademark holders.*
+
 ```hocon
 dependencies {
   duckdb { git = "github.com/sysl-lang/duckdb", version = "0.1.0" }

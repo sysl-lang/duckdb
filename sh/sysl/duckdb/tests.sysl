@@ -5,6 +5,7 @@ import sh.sysl.duckdb.c
 import sysl.buf.{Buf, buf}
 import sysl.fs.{make_temp_dir, remove_dir_all, write_text_atomic}
 import sysl.process.capture
+import sysl.raw.ptr_cast
 import sysl.sync.Atomic
 import sysl.text.{from_utf8, parse_real, Search, split}
 import sysl.threads.current

@@ -10,7 +10,7 @@
 package {
   name    = "duckdb"
   version = "0.1.0"
-  sysl    = "0.1.0-alpha.11"
+  sysl    = "0.6.0"
 }
 
 // **`headers` rather than `pkg_config`, and that is DuckDB's doing.** It installs a CMake package

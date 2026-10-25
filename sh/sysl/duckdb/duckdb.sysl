@@ -41,6 +41,7 @@
 module sh.sysl.duckdb
 
 import sh.sysl.duckdb.c
+import sysl.raw.ptr_cast
 import sysl.slices.as_ptr
 import sysl.text.{cstring, from_cstring, from_utf8}
 
